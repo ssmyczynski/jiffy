@@ -153,8 +153,10 @@ enc_flush(Encoder* e)
     return 1;
 }
 
+#define enc_ensure(e, req) ((e->have_buffer && (e->buffer.size - e->i) > req) || _enc_ensure(e, req))
+
 static inline int
-enc_ensure(Encoder* e, size_t req)
+_enc_ensure(Encoder* e, size_t req)
 {
     size_t new_size = BIN_INC_SIZE;
 
@@ -162,7 +164,7 @@ enc_ensure(Encoder* e, size_t req)
         if(req < (e->buffer.size - e->i)) {
             return 1;
         }
-
+        
         if(!enc_flush(e)) {
             return 0;
         }
@@ -396,93 +398,20 @@ enc_object_key(ErlNifEnv *env, Encoder* e, ERL_NIF_TERM val)
     return enc_string(e, val);
 }
 
-// From https://www.slideshare.net/andreialexandrescu1/three-optimization-tips-for-c-15708507
-
-#define P01 10
-#define P02 100
-#define P03 1000
-#define P04 10000
-#define P05 100000
-#define P06 1000000
-#define P07 10000000
-#define P08 100000000
-#define P09 1000000000
-#define P10 10000000000
-#define P11 100000000000L
-#define P12 1000000000000L
-
-int
-digits10(ErlNifUInt64 v)
-{
-    if (v < P01) return 1;
-    if (v < P02) return 2;
-    if (v < P03) return 3;
-    if (v < P12) {
-        if (v < P08) {
-            if (v < P06) {
-                if (v < P04) {
-                    return 4;
-                }
-                return 5 + (v >= P05);
-            }
-            return 7 + (v >= P07);
-        }
-        if (v < P10) {
-            return 9 + (v >= P09);
-        }
-        return 11 + (v >= P11);
-    }
-    return 12 + digits10(v / P12);
-}
-
-unsigned int
-u64ToAsciiTable(unsigned char *dst, ErlNifUInt64 value)
-{
-    static const char digits[201] =
-        "0001020304050607080910111213141516171819"
-        "2021222324252627282930313233343536373839"
-        "4041424344454647484950515253545556575859"
-        "6061626364656667686970717273747576777879"
-        "8081828384858687888990919293949596979899";
-    const int length = digits10(value);
-    int next = length - 1;
-    while (value >= 100) {
-        const int i = (value % 100) * 2;
-        value /= 100;
-        dst[next] = digits[i + 1];
-        dst[next - 1] = digits[i];
-        next -= 2;
-    }
-    // Handle last 1-2 digits.
-    if (value < 10) {
-        dst[next] = '0' + (unsigned int) value;
-    } else {
-        const int i = (unsigned int) value * 2;
-        dst[next] = digits[i + 1];
-        dst[next - 1] = digits[i];
-    }
-    return length;
-}
-
-unsigned
-i64ToAsciiTable(unsigned char *dst, ErlNifSInt64 value)
-{
-    if (value < 0) {
-        *dst++ = '-';
-        return 1 + u64ToAsciiTable(dst, -value);
-    } else {
-        return u64ToAsciiTable(dst, value);
-    }
-}
-
 static inline int
 enc_long(Encoder* e, ErlNifSInt64 val)
 {
+    size_t len;
+
     if(!enc_ensure(e, 32)) {
         return 0;
     }
 
-    e->i += i64ToAsciiTable(&(e->p[e->i]), val);
+    if(!format_int64(e->p + e->i, 32, &len, val)) {
+        return 0;
+    }
+
+    e->i += len;
     e->count++;
 
     return 1;
@@ -491,16 +420,13 @@ enc_long(Encoder* e, ErlNifSInt64 val)
 static inline int
 enc_double(Encoder* e, double val)
 {
-    unsigned char* start;
     size_t len;
 
     if(!enc_ensure(e, 32)) {
         return 0;
     }
 
-    start = &(e->p[e->i]);
-
-    if(!double_to_shortest(start, e->buffer.size, &len, val)) {
+    if(!format_double(e->p + e->i, 32, &len, val)) {
         return 0;
     }
 
@@ -701,6 +627,7 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ERL_NIF_TERM ret = 0;
 
     ERL_NIF_TERM curr;
+    ErlNifTermType curr_type;
     ERL_NIF_TERM item;
     const ERL_NIF_TERM* tuple;
     ERL_NIF_TERM tmp_argv[3];
@@ -764,8 +691,8 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         }
 
         curr = termstack_pop(&stack);
-
-        if(enif_is_atom(env, curr)) {
+        curr_type = enif_term_type(env, curr);
+        if(curr_type == ERL_NIF_TERM_TYPE_ATOM) {
             if(enif_is_identical(curr, e->atoms->ref_object)) {
                 curr = termstack_pop(&stack);
 
@@ -842,22 +769,22 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 ret = enc_obj_error(e, "invalid_string", curr);
                 goto done;
             }
-        } else if(enif_is_binary(env, curr)) {
+        } else if(curr_type == ERL_NIF_TERM_TYPE_BITSTRING) {
             if(!enc_string(e, curr)) {
                 ret = enc_obj_error(e, "invalid_string", curr);
                 goto done;
             }
-        } else if(enif_get_int64(env, curr, &lval)) {
+        } else if(curr_type == ERL_NIF_TERM_TYPE_INTEGER && enif_get_int64(env, curr, &lval)) {
             if(!enc_long(e, lval)) {
                 ret = enc_error(e, "internal_error");
                 goto done;
             }
-        } else if(enif_get_double(env, curr, &dval)) {
+        } else if((curr_type == ERL_NIF_TERM_TYPE_FLOAT || curr_type == ERL_NIF_TERM_TYPE_INTEGER) && enif_get_double(env, curr, &dval)) {
             if(!enc_double(e, dval)) {
                 ret = enc_error(e, "internal_error");
                 goto done;
             }
-        } else if(enif_get_tuple(env, curr, &arity, &tuple)) {
+        } else if(curr_type == ERL_NIF_TERM_TYPE_TUPLE && enif_get_tuple(env, curr, &arity, &tuple)) {
             if(arity != 1) {
                 ret = enc_obj_error(e, "invalid_ejson", curr);
                 goto done;
@@ -898,15 +825,15 @@ encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             termstack_push(&stack, e->atoms->ref_object);
             termstack_push(&stack, tuple[1]);
 #if MAP_TYPE_PRESENT
-        } else if(enif_is_map(env, curr)) {
-            if(!enc_map_to_ejson(env, curr, &curr)) {
-                ret = enc_error(e, "internal_error");
-                goto done;
-            }
+        } else if(curr_type == ERL_NIF_TERM_TYPE_MAP) {
+             if(!enc_map_to_ejson(env, curr, &curr)) {
+                 ret = enc_error(e, "internal_error");
+                 goto done;
+             }
 
-            termstack_push(&stack, curr);
+             termstack_push(&stack, curr);
 #endif
-        } else if(enif_is_list(env, curr)) {
+        } else if(curr_type == ERL_NIF_TERM_TYPE_LIST) {
             if(!enc_start_array(e)) {
                 ret = enc_error(e, "internal_error");
                 goto done;
